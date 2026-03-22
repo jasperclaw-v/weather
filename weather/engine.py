@@ -120,6 +120,11 @@ def scan_and_update(ctx):
                         print(f"  [WARN] Could not fetch real ask for {signal['market_id']}: {note[5:]}")
 
                     if signal and signal["entry_price"] < ctx.MAX_PRICE:
+                        if signal["ev"] < ctx.MIN_EV:
+                            print(
+                                f"  [SKIP] {loc['name']} {date} — live EV {signal['ev']:+.2f} below min {ctx.MIN_EV:.2f}"
+                            )
+                            continue
                         balance -= signal["cost"]
                         execution = maybe_execute_signal(signal, getattr(ctx, "execution_service", None))
                         if execution is not None:

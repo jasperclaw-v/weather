@@ -159,3 +159,56 @@ def test_scan_and_update_resolves_existing_market(monkeypatch, tmp_path):
     assert resolved == 1
     updated = storage.load_all_markets()[0]
     assert updated["status"] == "resolved"
+
+
+def test_scan_and_update_skips_after_live_ev_turns_negative(monkeypatch, tmp_path):
+    configure_temp_storage(monkeypatch, tmp_path)
+
+    def fake_snapshots(city_slug, dates):
+        return {
+            dates[0]: {
+                "ts": "2026-03-22T00:00:00+00:00",
+                "ecmwf": 76.0,
+                "hrrr": 76.0,
+                "metar": None,
+                "best": 76.0,
+                "best_source": "ecmwf",
+            }
+        }
+
+    def fake_event(city_slug, month, day, year):
+        if city_slug != "nyc" or day != 22 or month != "march" or year != 2026:
+            return None
+        return {
+            "endDate": "2026-03-23T00:00:00Z",
+            "markets": [
+                {
+                    "id": "m1",
+                    "question": "Will the highest temperature in nyc be between 75-77°F on March 22 2026?",
+                    "volume": 1500,
+                    "outcomePrices": "[0.08,0.09]",
+                }
+            ],
+        }
+
+    def fake_refresh(signal, max_slippage, max_price):
+        updated = signal.copy()
+        updated["entry_price"] = 0.95
+        updated["spread"] = 0.01
+        updated["shares"] = round(updated["cost"] / updated["entry_price"], 2)
+        updated["ev"] = -0.10
+        return updated, None
+
+    monkeypatch.setattr(runtime, "take_forecast_snapshot", fake_snapshots)
+    monkeypatch.setattr(runtime, "get_polymarket_event", fake_event)
+    monkeypatch.setattr(runtime, "refresh_signal_with_live_quotes", fake_refresh)
+    monkeypatch.setattr(runtime, "check_market_resolved", lambda market_id: None)
+    monkeypatch.setattr(runtime.time, "sleep", lambda _: None)
+    monkeypatch.setattr(runtime, "MAX_PRICE", 1.0)
+    monkeypatch.setattr(runtime.CONFIG, "max_price", 1.0)
+
+    new_pos, closed, resolved = runtime.scan_and_update()
+
+    assert new_pos == 0
+    assert closed == 0
+    assert resolved == 0
