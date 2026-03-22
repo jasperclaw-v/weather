@@ -1,7 +1,7 @@
 from pathlib import Path
 
-import bot_v2
 from weather.data import storage
+from weather import runtime
 
 
 def configure_temp_storage(monkeypatch, tmp_path: Path) -> None:
@@ -17,10 +17,10 @@ def configure_temp_storage(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(storage, "STATE_FILE", state_file)
     monkeypatch.setattr(storage, "TP_FILE", tp_file)
 
-    monkeypatch.setattr(bot_v2, "DATA_DIR", data_dir)
-    monkeypatch.setattr(bot_v2, "MARKETS_DIR", markets_dir)
-    monkeypatch.setattr(bot_v2, "CALIBRATION_FILE", calibration_file)
-    monkeypatch.setattr(bot_v2, "STATE_FILE", state_file)
+    monkeypatch.setattr(runtime, "DATA_DIR", data_dir)
+    monkeypatch.setattr(runtime, "MARKETS_DIR", markets_dir)
+    monkeypatch.setattr(runtime, "CALIBRATION_FILE", calibration_file)
+    monkeypatch.setattr(runtime, "STATE_FILE", state_file)
 
 
 def test_scan_and_update_opens_position(monkeypatch, tmp_path):
@@ -53,13 +53,13 @@ def test_scan_and_update_opens_position(monkeypatch, tmp_path):
             ],
         }
 
-    monkeypatch.setattr(bot_v2, "take_forecast_snapshot", fake_snapshots)
-    monkeypatch.setattr(bot_v2, "get_polymarket_event", fake_event)
-    monkeypatch.setattr(bot_v2, "refresh_signal_with_live_quotes", lambda signal, max_slippage, max_price: (signal, None))
-    monkeypatch.setattr(bot_v2, "check_market_resolved", lambda market_id: None)
-    monkeypatch.setattr(bot_v2.time, "sleep", lambda _: None)
+    monkeypatch.setattr(runtime, "take_forecast_snapshot", fake_snapshots)
+    monkeypatch.setattr(runtime, "get_polymarket_event", fake_event)
+    monkeypatch.setattr(runtime, "refresh_signal_with_live_quotes", lambda signal, max_slippage, max_price: (signal, None))
+    monkeypatch.setattr(runtime, "check_market_resolved", lambda market_id: None)
+    monkeypatch.setattr(runtime.time, "sleep", lambda _: None)
 
-    new_pos, closed, resolved = bot_v2.scan_and_update()
+    new_pos, closed, resolved = runtime.scan_and_update()
 
     assert new_pos == 1
     assert closed == 0
@@ -107,9 +107,9 @@ def test_monitor_positions_closes_position(monkeypatch, tmp_path):
         def json(self):
             return {}
 
-    monkeypatch.setattr(bot_v2.requests, "get", lambda *args, **kwargs: FakeResponse())
+    monkeypatch.setattr(runtime.requests, "get", lambda *args, **kwargs: FakeResponse())
 
-    closed = bot_v2.monitor_positions()
+    closed = runtime.monitor_positions()
 
     assert closed == 1
     updated = storage.load_all_markets()[0]
@@ -150,11 +150,11 @@ def test_scan_and_update_resolves_existing_market(monkeypatch, tmp_path):
         }
     )
 
-    monkeypatch.setattr(bot_v2, "get_polymarket_event", lambda *args, **kwargs: None)
-    monkeypatch.setattr(bot_v2, "check_market_resolved", lambda market_id: True)
-    monkeypatch.setattr(bot_v2.time, "sleep", lambda _: None)
+    monkeypatch.setattr(runtime, "get_polymarket_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runtime, "check_market_resolved", lambda market_id: True)
+    monkeypatch.setattr(runtime.time, "sleep", lambda _: None)
 
-    new_pos, closed, resolved = bot_v2.scan_and_update()
+    new_pos, closed, resolved = runtime.scan_and_update()
 
     assert new_pos == 0
     assert closed == 0
