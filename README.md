@@ -99,7 +99,9 @@ Use a Visual Crossing API key only if you want historical actual-temperature loo
 python weatherbet.py           # start the bot
 python weatherbet.py status    # balance and open positions
 python weatherbet.py report    # full breakdown of resolved markets
+python weatherbet.py scan      # isolated live paper scan, JSON output
 python -m weather.cli.main     # equivalent package entrypoint
+python3 -m streamlit run weather/ui/dashboard.py  # monitoring dashboard
 ```
 
 ---

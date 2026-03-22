@@ -42,3 +42,9 @@ def test_cli_scan_command_runs(monkeypatch):
         rc = main(["scan", "0.9", "0.4"])
     assert rc == 0
     assert "scan-report" in output.getvalue()
+
+
+def test_cli_dashboard_command_runs(monkeypatch):
+    monkeypatch.setattr("weather.cli.main.launch_dashboard", lambda: 0)
+    rc = main(["dashboard"])
+    assert rc == 0

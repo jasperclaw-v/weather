@@ -5,6 +5,7 @@ import sys
 
 from weather.backtests.engine import replay_from_storage
 from weather.scan import format_paper_scan_report, run_paper_scan
+from weather.ui.dashboard import launch_dashboard
 from weather import runtime
 
 
@@ -25,8 +26,10 @@ def main(argv=None) -> int:
         max_price = float(args[1]) if len(args) > 1 else None
         max_slippage = float(args[2]) if len(args) > 2 else None
         print(format_paper_scan_report(run_paper_scan(max_price=max_price, max_slippage=max_slippage)))
+    elif cmd == "dashboard":
+        return launch_dashboard()
     else:
-        print("Usage: python -m weather.cli.main [run|status|report|backtest|scan [max_price] [max_slippage]]")
+        print("Usage: python -m weather.cli.main [run|status|report|backtest|scan [max_price] [max_slippage]|dashboard]")
         return 1
     return 0
 

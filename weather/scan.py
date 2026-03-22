@@ -1,8 +1,10 @@
 """One-shot paper scan helpers that do not mutate the main saved state."""
 
 import json
+import io
 import tempfile
 from contextlib import contextmanager
+from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Dict, Iterator, Optional
 
@@ -66,7 +68,9 @@ def isolated_scan_environment(max_price: Optional[float] = None, max_slippage: O
 def run_paper_scan(max_price: Optional[float] = None, max_slippage: Optional[float] = None) -> Dict[str, object]:
     with isolated_scan_environment(max_price=max_price, max_slippage=max_slippage):
         runtime._cal = runtime.load_cal()
-        scan_result = runtime.scan_and_update()
+        output = io.StringIO()
+        with redirect_stdout(output):
+            scan_result = runtime.scan_and_update()
         markets = storage.load_all_markets()
         open_positions = []
         for market in markets:
@@ -91,6 +95,7 @@ def run_paper_scan(max_price: Optional[float] = None, max_slippage: Optional[flo
                 "max_price": runtime.MAX_PRICE,
                 "max_slippage": runtime.MAX_SLIPPAGE,
             },
+            "log": [line for line in output.getvalue().splitlines() if line.strip()],
             "scan_result": {
                 "new": scan_result[0],
                 "closed": scan_result[1],
