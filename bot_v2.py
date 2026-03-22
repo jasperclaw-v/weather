@@ -12,433 +12,114 @@ Usage:
     python weatherbet.py status   # balance and open positions
 """
 
-import re
 import sys
 import json
-import math
 import time
 import requests
+from dataclasses import asdict
 from datetime import datetime, timezone, timedelta
-from pathlib import Path
+
+from weather.config import load_config
+from weather.core.constants import (
+    DEFAULT_KELLY_FRACTION,
+    DEFAULT_MAX_BET,
+    DEFAULT_SIGMA_C,
+    DEFAULT_SIGMA_F,
+)
+from weather.core.finance import bet_size, calc_ev, calc_kelly as core_calc_kelly
+from weather.core.probability import bucket_probability as bucket_prob, in_bucket
+from weather.data.mapping import LOCATIONS as LOCATION_MODELS, MONTHS
+from weather.data.mapping import TIMEZONES
+from weather.data.models.metar import get_metar
+from weather.data.models.openmeteo import get_ecmwf, get_hrrr
+from weather.data.snapshots import take_forecast_snapshot
+from weather.data.storage import (
+    CALIBRATION_FILE,
+    DATA_DIR,
+    MARKETS_DIR,
+    STATE_FILE,
+    load_all_markets,
+    load_market,
+    load_state as storage_load_state,
+    new_market_record,
+    save_market,
+    save_state as storage_save_state,
+)
+from weather.execution.polymarket import (
+    check_market_resolved,
+    get_market_price,
+    get_polymarket_event,
+    hours_to_resolution,
+    parse_temp_range,
+)
+from weather.strategy.calibration import (
+    get_sigma as calibration_get_sigma,
+    load_calibration,
+    run_sigma_calibration,
+)
+from weather.strategy.risk import DEFAULT_TP_SCHEDULE, get_tp_threshold
+from weather.strategy.scanner import build_outcomes, select_signal
 
 # =============================================================================
 # CONFIG
 # =============================================================================
 
-with open("config.json", encoding="utf-8") as f:
-    _cfg = json.load(f)
+_cfg = load_config()
 
 BALANCE          = _cfg.get("balance", 10000.0)
-MAX_BET          = _cfg.get("max_bet", 20.0)        # max bet per trade
+MAX_BET          = _cfg.get("max_bet", DEFAULT_MAX_BET)        # max bet per trade
 MIN_EV           = _cfg.get("min_ev", 0.10)
 MAX_PRICE        = _cfg.get("max_price", 0.45)
 MIN_VOLUME       = _cfg.get("min_volume", 500)
 MIN_HOURS        = _cfg.get("min_hours", 2.0)
 MAX_HOURS        = _cfg.get("max_hours", 72.0)
-KELLY_FRACTION   = _cfg.get("kelly_fraction", 0.25)
+KELLY_FRACTION   = _cfg.get("kelly_fraction", DEFAULT_KELLY_FRACTION)
 MAX_SLIPPAGE     = _cfg.get("max_slippage", 0.03)  # max allowed ask-bid spread
 SCAN_INTERVAL    = _cfg.get("scan_interval", 3600)   # every hour
 CALIBRATION_MIN  = _cfg.get("calibration_min", 30)
 VC_KEY           = _cfg.get("vc_key", "")
 
-SIGMA_F = 2.0
-SIGMA_C = 1.2
+SIGMA_F = DEFAULT_SIGMA_F
+SIGMA_C = DEFAULT_SIGMA_C
 
-DATA_DIR         = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
-STATE_FILE       = DATA_DIR / "state.json"
-MARKETS_DIR      = DATA_DIR / "markets"
 MARKETS_DIR.mkdir(exist_ok=True)
-CALIBRATION_FILE = DATA_DIR / "calibration.json"
 
-LOCATIONS = {
-    "nyc":          {"lat": 40.7772,  "lon":  -73.8726, "name": "New York City", "station": "KLGA", "unit": "F", "region": "us"},
-    "chicago":      {"lat": 41.9742,  "lon":  -87.9073, "name": "Chicago",       "station": "KORD", "unit": "F", "region": "us"},
-    "miami":        {"lat": 25.7959,  "lon":  -80.2870, "name": "Miami",         "station": "KMIA", "unit": "F", "region": "us"},
-    "dallas":       {"lat": 32.8471,  "lon":  -96.8518, "name": "Dallas",        "station": "KDAL", "unit": "F", "region": "us"},
-    "seattle":      {"lat": 47.4502,  "lon": -122.3088, "name": "Seattle",       "station": "KSEA", "unit": "F", "region": "us"},
-    "atlanta":      {"lat": 33.6407,  "lon":  -84.4277, "name": "Atlanta",       "station": "KATL", "unit": "F", "region": "us"},
-    "london":       {"lat": 51.5048,  "lon":    0.0495, "name": "London",        "station": "EGLC", "unit": "C", "region": "eu"},
-    "paris":        {"lat": 48.9962,  "lon":    2.5979, "name": "Paris",         "station": "LFPG", "unit": "C", "region": "eu"},
-    "munich":       {"lat": 48.3537,  "lon":   11.7750, "name": "Munich",        "station": "EDDM", "unit": "C", "region": "eu"},
-    "ankara":       {"lat": 40.1281,  "lon":   32.9951, "name": "Ankara",        "station": "LTAC", "unit": "C", "region": "eu"},
-    "seoul":        {"lat": 37.4691,  "lon":  126.4505, "name": "Seoul",         "station": "RKSI", "unit": "C", "region": "asia"},
-    "tokyo":        {"lat": 35.7647,  "lon":  140.3864, "name": "Tokyo",         "station": "RJTT", "unit": "C", "region": "asia"},
-    "shanghai":     {"lat": 31.1443,  "lon":  121.8083, "name": "Shanghai",      "station": "ZSPD", "unit": "C", "region": "asia"},
-    "singapore":    {"lat":  1.3502,  "lon":  103.9940, "name": "Singapore",     "station": "WSSS", "unit": "C", "region": "asia"},
-    "lucknow":      {"lat": 26.7606,  "lon":   80.8893, "name": "Lucknow",       "station": "VILK", "unit": "C", "region": "asia"},
-    "tel-aviv":     {"lat": 32.0114,  "lon":   34.8867, "name": "Tel Aviv",      "station": "LLBG", "unit": "C", "region": "asia"},
-    "toronto":      {"lat": 43.6772,  "lon":  -79.6306, "name": "Toronto",       "station": "CYYZ", "unit": "C", "region": "ca"},
-    "sao-paulo":    {"lat": -23.4356, "lon":  -46.4731, "name": "Sao Paulo",     "station": "SBGR", "unit": "C", "region": "sa"},
-    "buenos-aires": {"lat": -34.8222, "lon":  -58.5358, "name": "Buenos Aires",  "station": "SAEZ", "unit": "C", "region": "sa"},
-    "wellington":   {"lat": -41.3272, "lon":  174.8052, "name": "Wellington",    "station": "NZWN", "unit": "C", "region": "oc"},
-}
-
-TIMEZONES = {
-    "nyc": "America/New_York", "chicago": "America/Chicago",
-    "miami": "America/New_York", "dallas": "America/Chicago",
-    "seattle": "America/Los_Angeles", "atlanta": "America/New_York",
-    "london": "Europe/London", "paris": "Europe/Paris",
-    "munich": "Europe/Berlin", "ankara": "Europe/Istanbul",
-    "seoul": "Asia/Seoul", "tokyo": "Asia/Tokyo",
-    "shanghai": "Asia/Shanghai", "singapore": "Asia/Singapore",
-    "lucknow": "Asia/Kolkata", "tel-aviv": "Asia/Jerusalem",
-    "toronto": "America/Toronto", "sao-paulo": "America/Sao_Paulo",
-    "buenos-aires": "America/Argentina/Buenos_Aires", "wellington": "Pacific/Auckland",
-}
-
-MONTHS = ["january","february","march","april","may","june",
-          "july","august","september","october","november","december"]
-
-# =============================================================================
-# MATH
-# =============================================================================
-
-def norm_cdf(x):
-    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
-
-def bucket_prob(forecast, t_low, t_high, sigma=None):
-    """For regular buckets — exact match. For edge buckets — normal distribution."""
-    s = sigma or 2.0
-    if t_low == -999:
-        return norm_cdf((t_high - float(forecast)) / s)
-    if t_high == 999:
-        return 1.0 - norm_cdf((t_low - float(forecast)) / s)
-    return 1.0 if in_bucket(forecast, t_low, t_high) else 0.0
-
-def calc_ev(p, price):
-    if price <= 0 or price >= 1: return 0.0
-    return round(p * (1.0 / price - 1.0) - (1.0 - p), 4)
-
-def calc_kelly(p, price):
-    if price <= 0 or price >= 1: return 0.0
-    b = 1.0 / price - 1.0
-    f = (p * b - (1.0 - p)) / b
-    return round(min(max(0.0, f) * KELLY_FRACTION, 1.0), 4)
-
-def bet_size(kelly, balance):
-    raw = kelly * balance
-    return round(min(raw, MAX_BET), 2)
-
-# =============================================================================
-# CALIBRATION
-# =============================================================================
+LOCATIONS = {slug: asdict(location) for slug, location in LOCATION_MODELS.items()}
 
 _cal: dict = {}
 
+
+def calc_kelly(p, price):
+    return core_calc_kelly(p, price, fraction=KELLY_FRACTION)
+
 def load_cal():
-    if CALIBRATION_FILE.exists():
-        return json.loads(CALIBRATION_FILE.read_text(encoding="utf-8"))
-    return {}
+    return load_calibration()
 
 def get_sigma(city_slug, source="ecmwf"):
-    key = f"{city_slug}_{source}"
-    if key in _cal:
-        return _cal[key]["sigma"]
-    return SIGMA_F if LOCATIONS[city_slug]["unit"] == "F" else SIGMA_C
+    return calibration_get_sigma(city_slug, source=source, calibration=_cal)
 
 def run_calibration(markets):
-    """Recalculates sigma from resolved markets."""
-    resolved = [m for m in markets if m.get("resolved") and m.get("actual_temp") is not None]
-    cal = load_cal()
-    updated = []
-
-    for source in ["ecmwf", "hrrr", "metar"]:
-        for city in set(m["city"] for m in resolved):
-            group = [m for m in resolved if m["city"] == city]
-            errors = []
-            for m in group:
-                snap = next((s for s in reversed(m.get("forecast_snapshots", []))
-                             if s["source"] == source), None)
-                if snap and snap.get("temp") is not None:
-                    errors.append(abs(snap["temp"] - m["actual_temp"]))
-            if len(errors) < CALIBRATION_MIN:
-                continue
-            mae  = sum(errors) / len(errors)
-            key  = f"{city}_{source}"
-            old  = cal.get(key, {}).get("sigma", SIGMA_F if LOCATIONS[city]["unit"] == "F" else SIGMA_C)
-            new  = round(mae, 3)
-            cal[key] = {"sigma": new, "n": len(errors), "updated_at": datetime.now(timezone.utc).isoformat()}
-            if abs(new - old) > 0.05:
-                updated.append(f"{LOCATIONS[city]['name']} {source}: {old:.2f}->{new:.2f}")
-
-    CALIBRATION_FILE.write_text(json.dumps(cal, indent=2), encoding="utf-8")
-    if updated:
-        print(f"  [CAL] {', '.join(updated)}")
-    return cal
-
-# =============================================================================
-# FORECASTS
-# =============================================================================
-
-def get_ecmwf(city_slug, dates):
-    """ECMWF via Open-Meteo with bias correction. For all cities."""
-    loc = LOCATIONS[city_slug]
-    unit = loc["unit"]
-    temp_unit = "fahrenheit" if unit == "F" else "celsius"
-    result = {}
-    url = (
-        f"https://api.open-meteo.com/v1/forecast"
-        f"?latitude={loc['lat']}&longitude={loc['lon']}"
-        f"&daily=temperature_2m_max&temperature_unit={temp_unit}"
-        f"&forecast_days=7&timezone={TIMEZONES.get(city_slug, 'UTC')}"
-        f"&models=ecmwf_ifs025&bias_correction=true"
-    )
-    for attempt in range(3):
-        try:
-            data = requests.get(url, timeout=(5, 10)).json()
-            if "error" not in data:
-                for date, temp in zip(data["daily"]["time"], data["daily"]["temperature_2m_max"]):
-                    if date in dates and temp is not None:
-                        result[date] = round(temp, 1) if unit == "C" else round(temp)
-            break
-        except Exception as e:
-            if attempt < 2:
-                time.sleep(3)
-            else:
-                print(f"  [ECMWF] {city_slug}: {e}")
-    return result
-
-def get_hrrr(city_slug, dates):
-    """HRRR via Open-Meteo. US cities only, up to 48h horizon."""
-    loc = LOCATIONS[city_slug]
-    if loc["region"] != "us":
-        return {}
-    result = {}
-    url = (
-        f"https://api.open-meteo.com/v1/forecast"
-        f"?latitude={loc['lat']}&longitude={loc['lon']}"
-        f"&daily=temperature_2m_max&temperature_unit=fahrenheit"
-        f"&forecast_days=3&timezone={TIMEZONES.get(city_slug, 'UTC')}"
-        f"&models=gfs_seamless"  # HRRR+GFS seamless — best option for US
-    )
-    for attempt in range(3):
-        try:
-            data = requests.get(url, timeout=(5, 10)).json()
-            if "error" not in data:
-                for date, temp in zip(data["daily"]["time"], data["daily"]["temperature_2m_max"]):
-                    if date in dates and temp is not None:
-                        result[date] = round(temp)
-            break
-        except Exception as e:
-            if attempt < 2:
-                time.sleep(3)
-            else:
-                print(f"  [HRRR] {city_slug}: {e}")
-    return result
-
-def get_metar(city_slug):
-    """Current observed temperature from METAR station. D+0 only."""
-    loc = LOCATIONS[city_slug]
-    station = loc["station"]
-    unit = loc["unit"]
-    try:
-        url = f"https://aviationweather.gov/api/data/metar?ids={station}&format=json"
-        data = requests.get(url, timeout=(5, 8)).json()
-        if data and isinstance(data, list):
-            temp_c = data[0].get("temp")
-            if temp_c is not None:
-                if unit == "F":
-                    return round(float(temp_c) * 9/5 + 32)
-                return round(float(temp_c), 1)
-    except Exception as e:
-        print(f"  [METAR] {city_slug}: {e}")
-    return None
-
-def get_actual_temp(city_slug, date_str):
-    """Actual temperature via Visual Crossing for closed markets."""
-    loc = LOCATIONS[city_slug]
-    station = loc["station"]
-    unit = loc["unit"]
-    vc_unit = "us" if unit == "F" else "metric"
-    url = (
-        f"https://weather.visualcrossing.com/VisualCrossingWebServices/rest/services/timeline"
-        f"/{station}/{date_str}/{date_str}"
-        f"?unitGroup={vc_unit}&key={VC_KEY}&include=days&elements=tempmax"
-    )
-    try:
-        data = requests.get(url, timeout=(5, 8)).json()
-        days = data.get("days", [])
-        if days and days[0].get("tempmax") is not None:
-            return round(float(days[0]["tempmax"]), 1)
-    except Exception as e:
-        print(f"  [VC] {city_slug} {date_str}: {e}")
-    return None
-
-def check_market_resolved(market_id):
-    """
-    Checks if the market closed on Polymarket and who won.
-    Returns: None (still open), True (YES won), False (NO won)
-    """
-    try:
-        r = requests.get(f"https://gamma-api.polymarket.com/markets/{market_id}", timeout=(5, 8))
-        data = r.json()
-        closed = data.get("closed", False)
-        if not closed:
-            return None
-        # Check YES price — if ~1.0 then WIN, if ~0.0 then LOSS
-        prices = json.loads(data.get("outcomePrices", "[0.5,0.5]"))
-        yes_price = float(prices[0])
-        if yes_price >= 0.95:
-            return True   # WIN
-        elif yes_price <= 0.05:
-            return False  # LOSS
-        return None  # not yet determined
-    except Exception as e:
-        print(f"  [RESOLVE] {market_id}: {e}")
-    return None
-
-# =============================================================================
-# POLYMARKET
-# =============================================================================
-
-def get_polymarket_event(city_slug, month, day, year):
-    slug = f"highest-temperature-in-{city_slug}-on-{month}-{day}-{year}"
-    try:
-        r = requests.get(f"https://gamma-api.polymarket.com/events?slug={slug}", timeout=(5, 8))
-        data = r.json()
-        if data and isinstance(data, list) and len(data) > 0:
-            return data[0]
-    except Exception:
-        pass
-    return None
-
-def get_market_price(market_id):
-    try:
-        r = requests.get(f"https://gamma-api.polymarket.com/markets/{market_id}", timeout=(3, 5))
-        prices = json.loads(r.json().get("outcomePrices", "[0.5,0.5]"))
-        return float(prices[0])
-    except Exception:
-        return None
-
-def parse_temp_range(question):
-    if not question: return None
-    num = r'(-?\d+(?:\.\d+)?)'
-    if re.search(r'or below', question, re.IGNORECASE):
-        m = re.search(num + r'[°]?[FC] or below', question, re.IGNORECASE)
-        if m: return (-999.0, float(m.group(1)))
-    if re.search(r'or higher', question, re.IGNORECASE):
-        m = re.search(num + r'[°]?[FC] or higher', question, re.IGNORECASE)
-        if m: return (float(m.group(1)), 999.0)
-    m = re.search(r'between ' + num + r'-' + num + r'[°]?[FC]', question, re.IGNORECASE)
-    if m: return (float(m.group(1)), float(m.group(2)))
-    m = re.search(r'be ' + num + r'[°]?[FC] on', question, re.IGNORECASE)
-    if m:
-        v = float(m.group(1))
-        return (v, v)
-    return None
-
-def hours_to_resolution(end_date_str):
-    try:
-        end = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
-        return max(0.0, (end - datetime.now(timezone.utc)).total_seconds() / 3600)
-    except Exception:
-        return 999.0
-
-def in_bucket(forecast, t_low, t_high):
-    if t_low == t_high:
-        return round(float(forecast)) == round(t_low)
-    return t_low <= float(forecast) <= t_high
+    return run_sigma_calibration(markets, calibration_min=CALIBRATION_MIN)
 
 # =============================================================================
 # MARKET DATA STORAGE
 # Each market is stored in a separate file: data/markets/{city}_{date}.json
 # =============================================================================
 
-def market_path(city_slug, date_str):
-    return MARKETS_DIR / f"{city_slug}_{date_str}.json"
-
-def load_market(city_slug, date_str):
-    p = market_path(city_slug, date_str)
-    if p.exists():
-        return json.loads(p.read_text(encoding="utf-8"))
-    return None
-
-def save_market(market):
-    p = market_path(market["city"], market["date"])
-    p.write_text(json.dumps(market, indent=2, ensure_ascii=False), encoding="utf-8")
-
-def load_all_markets():
-    markets = []
-    for f in MARKETS_DIR.glob("*.json"):
-        try:
-            markets.append(json.loads(f.read_text(encoding="utf-8")))
-        except Exception:
-            pass
-    return markets
-
 def new_market(city_slug, date_str, event, hours):
     loc = LOCATIONS[city_slug]
-    return {
-        "city":               city_slug,
-        "city_name":          loc["name"],
-        "date":               date_str,
-        "unit":               loc["unit"],
-        "station":            loc["station"],
-        "event_end_date":     event.get("endDate", ""),
-        "hours_at_discovery": round(hours, 1),
-        "status":             "open",           # open | closed | resolved
-        "position":           None,             # filled when position opens
-        "actual_temp":        None,             # filled after resolution
-        "resolved_outcome":   None,             # win / loss / no_position
-        "pnl":                None,
-        "forecast_snapshots": [],               # list of forecast snapshots
-        "market_snapshots":   [],               # list of market price snapshots
-        "all_outcomes":       [],               # all market buckets
-        "created_at":         datetime.now(timezone.utc).isoformat(),
-    }
+    return new_market_record(city_slug, loc, date_str, event, hours)
 
 # =============================================================================
 # STATE (balance and open positions)
 # =============================================================================
 
 def load_state():
-    if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    return {
-        "balance":          BALANCE,
-        "starting_balance": BALANCE,
-        "total_trades":     0,
-        "wins":             0,
-        "losses":           0,
-        "peak_balance":     BALANCE,
-    }
+    return storage_load_state(default_balance=BALANCE)
 
 def save_state(state):
-    STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
-
-# =============================================================================
-# CORE LOGIC
-# =============================================================================
-
-def take_forecast_snapshot(city_slug, dates):
-    """Fetches forecasts from all sources and returns a snapshot."""
-    now_str = datetime.now(timezone.utc).isoformat()
-    ecmwf   = get_ecmwf(city_slug, dates)
-    hrrr    = get_hrrr(city_slug, dates)
-    today   = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-    snapshots = {}
-    for date in dates:
-        snap = {
-            "ts":    now_str,
-            "ecmwf": ecmwf.get(date),
-            "hrrr":  hrrr.get(date) if date <= (datetime.now(timezone.utc) + timedelta(days=2)).strftime("%Y-%m-%d") else None,
-            "metar": get_metar(city_slug) if date == today else None,
-        }
-        # Best forecast: HRRR for US D+0/D+1, otherwise ECMWF
-        loc = LOCATIONS[city_slug]
-        if loc["region"] == "us" and snap["hrrr"] is not None:
-            snap["best"] = snap["hrrr"]
-            snap["best_source"] = "hrrr"
-        elif snap["ecmwf"] is not None:
-            snap["best"] = snap["ecmwf"]
-            snap["best_source"] = "ecmwf"
-        else:
-            snap["best"] = None
-            snap["best_source"] = None
-        snapshots[date] = snap
-    return snapshots
+    storage_save_state(state)
 
 def scan_and_update():
     """Main function of one cycle: updates forecasts, opens/closes positions."""
@@ -485,32 +166,7 @@ def scan_and_update():
                 continue
 
             # Update outcomes list — prices taken directly from event
-            outcomes = []
-            for market in event.get("markets", []):
-                question = market.get("question", "")
-                mid      = str(market.get("id", ""))
-                volume   = float(market.get("volume", 0))
-                rng      = parse_temp_range(question)
-                if not rng:
-                    continue
-                try:
-                    prices = json.loads(market.get("outcomePrices", "[0.5,0.5]"))
-                    bid = float(prices[0])
-                    ask = float(prices[1]) if len(prices) > 1 else bid
-                except Exception:
-                    continue
-                outcomes.append({
-                    "question":  question,
-                    "market_id": mid,
-                    "range":     rng,
-                    "bid":       round(bid, 4),
-                    "ask":       round(ask, 4),
-                    "price":     round(bid, 4),   # for compatibility
-                    "spread":    round(ask - bid, 4),
-                    "volume":    round(volume, 0),
-                })
-
-            outcomes.sort(key=lambda x: x["range"][0])
+            outcomes = build_outcomes(event)
             mkt["all_outcomes"] = outcomes
 
             # Forecast snapshot
@@ -601,56 +257,18 @@ def scan_and_update():
             # --- OPEN POSITION ---
             if not mkt.get("position") and forecast_temp is not None and hours >= MIN_HOURS:
                 sigma = get_sigma(city_slug, best_source or "ecmwf")
-                best_signal = None
-
-                # Find exactly ONE bucket that matches the forecast
-                # If forecast doesn't fit any bucket cleanly — skip this market
-                matched_bucket = None
-                for o in outcomes:
-                    t_low, t_high = o["range"]
-                    if in_bucket(forecast_temp, t_low, t_high):
-                        matched_bucket = o
-                        break
-
-                if matched_bucket:
-                    o = matched_bucket
-                    t_low, t_high = o["range"]
-                    volume = o["volume"]
-                    bid    = o.get("bid", o["price"])
-                    ask    = o.get("ask", o["price"])
-                    spread = o.get("spread", 0)
-
-                    # All filters — if any fails, skip this market entirely
-                    if volume >= MIN_VOLUME:
-                        p  = bucket_prob(forecast_temp, t_low, t_high, sigma)
-                        ev = calc_ev(p, ask)
-                        if ev >= MIN_EV:
-                            kelly = calc_kelly(p, ask)
-                            size  = bet_size(kelly, balance)
-                            if size >= 0.50:
-                                best_signal = {
-                                    "market_id":    o["market_id"],
-                                    "question":     o["question"],
-                                    "bucket_low":   t_low,
-                                    "bucket_high":  t_high,
-                                    "entry_price":  ask,
-                                    "bid_at_entry": bid,
-                                    "spread":       spread,
-                                    "shares":       round(size / ask, 2),
-                                    "cost":         size,
-                                    "p":            round(p, 4),
-                                    "ev":           round(ev, 4),
-                                    "kelly":        round(kelly, 4),
-                                    "forecast_temp":forecast_temp,
-                                    "forecast_src": best_source,
-                                    "sigma":        sigma,
-                                    "opened_at":    snap.get("ts"),
-                                    "status":       "open",
-                                    "pnl":          None,
-                                    "exit_price":   None,
-                                    "close_reason": None,
-                                    "closed_at":    None,
-                                }
+                best_signal = select_signal(
+                    outcomes=outcomes,
+                    forecast_temp=forecast_temp,
+                    sigma=sigma,
+                    best_source=best_source,
+                    opened_at=snap.get("ts"),
+                    balance=balance,
+                    min_volume=MIN_VOLUME,
+                    min_ev=MIN_EV,
+                    kelly_fraction=KELLY_FRACTION,
+                    max_bet=MAX_BET,
+                )
 
                 if best_signal:
                     # Fetch real bestAsk from Polymarket API for accurate entry price
@@ -903,13 +521,7 @@ def monitor_positions():
         end_date = mkt.get("event_end_date", "")
         hours_left = hours_to_resolution(end_date) if end_date else 999.0
 
-        # Take-profit threshold based on hours to resolution
-        if hours_left < 24:
-            take_profit = None        # hold to resolution
-        elif hours_left < 48:
-            take_profit = 0.85        # 24-48h: take profit at $0.85
-        else:
-            take_profit = 0.75        # 48h+: take profit at $0.75
+        take_profit = get_tp_threshold(hours_left, DEFAULT_TP_SCHEDULE)
 
         # Trailing: if up 20%+ — move stop to breakeven
         if current_price >= entry * 1.20 and stop < entry:
