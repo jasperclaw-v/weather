@@ -13,32 +13,16 @@ Usage:
 """
 
 import sys
-import json
 import time
 import requests
-from dataclasses import asdict
-from datetime import datetime, timezone, timedelta
-from types import SimpleNamespace
+from datetime import datetime
 
-from weather.config import load_config
-from weather.core.constants import (
-    DEFAULT_KELLY_FRACTION,
-    DEFAULT_MAX_BET,
-    DEFAULT_SIGMA_C,
-    DEFAULT_SIGMA_F,
-)
-from weather.core.finance import bet_size, calc_ev, calc_kelly as core_calc_kelly
-from weather.core.probability import bucket_probability as bucket_prob, in_bucket
-from weather.data.mapping import LOCATIONS as LOCATION_MODELS, MONTHS
-from weather.data.mapping import TIMEZONES
-from weather.data.models.metar import get_metar
-from weather.data.models.openmeteo import get_ecmwf, get_hrrr
+from weather.app import build_runtime_context, load_runtime_config, runtime_locations
+from weather.core.finance import calc_kelly as core_calc_kelly
 from weather.data.snapshots import take_forecast_snapshot
 from weather.data.storage import (
-    CALIBRATION_FILE,
     DATA_DIR,
     MARKETS_DIR,
-    STATE_FILE,
     load_all_markets,
     load_market,
     load_state as storage_load_state,
@@ -48,17 +32,15 @@ from weather.data.storage import (
 )
 from weather.execution.polymarket import (
     check_market_resolved,
-    get_market_price,
     get_polymarket_event,
     hours_to_resolution,
-    parse_temp_range,
 )
 from weather.strategy.calibration import (
     get_sigma as calibration_get_sigma,
     load_calibration,
     run_sigma_calibration,
 )
-from weather.strategy.risk import DEFAULT_TP_SCHEDULE, get_tp_threshold
+from weather.strategy.risk import DEFAULT_TP_SCHEDULE
 from weather.strategy.lifecycle import (
     apply_monitor_exit,
     apply_resolution,
@@ -67,36 +49,30 @@ from weather.strategy.lifecycle import (
     refresh_signal_with_live_quotes,
 )
 from weather.strategy.scanner import build_outcomes, select_signal
-from weather.reporting import render_report_header, render_status
+from weather.reporting import print_full_report, print_status_report
 from weather.engine import monitor_positions as engine_monitor_positions
 from weather.engine import scan_and_update as engine_scan_and_update
 
-# =============================================================================
-# CONFIG
-# =============================================================================
+CONFIG = load_runtime_config()
 
-_cfg = load_config()
-
-BALANCE          = _cfg.get("balance", 10000.0)
-MAX_BET          = _cfg.get("max_bet", DEFAULT_MAX_BET)        # max bet per trade
-MIN_EV           = _cfg.get("min_ev", 0.10)
-MAX_PRICE        = _cfg.get("max_price", 0.45)
-MIN_VOLUME       = _cfg.get("min_volume", 500)
-MIN_HOURS        = _cfg.get("min_hours", 2.0)
-MAX_HOURS        = _cfg.get("max_hours", 72.0)
-KELLY_FRACTION   = _cfg.get("kelly_fraction", DEFAULT_KELLY_FRACTION)
-MAX_SLIPPAGE     = _cfg.get("max_slippage", 0.03)  # max allowed ask-bid spread
-SCAN_INTERVAL    = _cfg.get("scan_interval", 3600)   # every hour
-CALIBRATION_MIN  = _cfg.get("calibration_min", 30)
-VC_KEY           = _cfg.get("vc_key", "")
-
-SIGMA_F = DEFAULT_SIGMA_F
-SIGMA_C = DEFAULT_SIGMA_C
+BALANCE = CONFIG.balance
+MAX_BET = CONFIG.max_bet
+MIN_EV = CONFIG.min_ev
+MAX_PRICE = CONFIG.max_price
+MIN_VOLUME = CONFIG.min_volume
+MIN_HOURS = CONFIG.min_hours
+MAX_HOURS = CONFIG.max_hours
+KELLY_FRACTION = CONFIG.kelly_fraction
+MAX_SLIPPAGE = CONFIG.max_slippage
+SCAN_INTERVAL = CONFIG.scan_interval
+CALIBRATION_MIN = CONFIG.calibration_min
+SIGMA_F = CONFIG.sigma_f
+SIGMA_C = CONFIG.sigma_c
 
 DATA_DIR.mkdir(exist_ok=True)
 MARKETS_DIR.mkdir(exist_ok=True)
 
-LOCATIONS = {slug: asdict(location) for slug, location in LOCATION_MODELS.items()}
+LOCATIONS = runtime_locations()
 
 _cal: dict = {}
 
@@ -138,20 +114,9 @@ def _set_calibration(value):
 
 
 def runtime_context():
-    return SimpleNamespace(
-        LOCATIONS=LOCATIONS,
-        MONTHS=MONTHS,
-        MIN_HOURS=MIN_HOURS,
-        MAX_HOURS=MAX_HOURS,
-        MIN_VOLUME=MIN_VOLUME,
-        MIN_EV=MIN_EV,
-        KELLY_FRACTION=KELLY_FRACTION,
-        MAX_BET=MAX_BET,
-        MAX_SLIPPAGE=MAX_SLIPPAGE,
-        MAX_PRICE=MAX_PRICE,
-        CALIBRATION_MIN=CALIBRATION_MIN,
-        DEFAULT_TP_SCHEDULE=DEFAULT_TP_SCHEDULE,
-        requests=requests,
+    return build_runtime_context(
+        locations=LOCATIONS,
+        config=CONFIG,
         sleep=time.sleep,
         load_state=load_state,
         save_state=save_state,
@@ -183,90 +148,16 @@ def scan_and_update():
 # =============================================================================
 
 def print_status():
-    state    = load_state()
-    markets  = load_all_markets()
-    open_pos = [m for m in markets if m.get("position") and m["position"].get("status") == "open"]
-    resolved = [m for m in markets if m["status"] == "resolved" and m.get("pnl") is not None]
-
-    bal     = state["balance"]
-    start   = state["starting_balance"]
-    ret_pct = (bal - start) / start * 100
-    wins    = state["wins"]
-    losses  = state["losses"]
-    total   = wins + losses
-
-    print(render_status(state, open_pos))
-    print(f"  Resolved:    {len(resolved)}")
-
-    if open_pos:
-        print(f"\n  Open positions:")
-        total_unrealized = 0.0
-        for m in open_pos:
-            pos      = m["position"]
-            unit_sym = "F" if m["unit"] == "F" else "C"
-            label    = f"{pos['bucket_low']}-{pos['bucket_high']}{unit_sym}"
-
-            # Current price from latest market snapshot
-            current_price = pos["entry_price"]
-            snaps = m.get("market_snapshots", [])
-            if snaps:
-                # Find our bucket price in all_outcomes
-                current_price = find_outcome_price(m.get("all_outcomes", []), pos["market_id"], side="price") or current_price
-
-            unrealized = round((current_price - pos["entry_price"]) * pos["shares"], 2)
-            total_unrealized += unrealized
-            pnl_str = f"{'+'if unrealized>=0 else ''}{unrealized:.2f}"
-
-            print(f"    {m['city_name']:<16} {m['date']} | {label:<14} | "
-                  f"entry ${pos['entry_price']:.3f} -> ${current_price:.3f} | "
-                  f"PnL: {pnl_str} | {pos['forecast_src'].upper()}")
-
-        sign = "+" if total_unrealized >= 0 else ""
-        print(f"\n  Unrealized PnL: {sign}{total_unrealized:.2f}")
-
-    print(f"{'='*55}\n")
+    print_status_report(
+        state=load_state(),
+        markets=load_all_markets(),
+        find_outcome_price=find_outcome_price,
+    )
 
 def print_report():
-    markets  = load_all_markets()
+    markets = load_all_markets()
     resolved = [m for m in markets if m["status"] == "resolved" and m.get("pnl") is not None]
-
-    print(render_report_header(resolved))
-
-    if not resolved:
-        return
-
-    total_pnl = sum(m["pnl"] for m in resolved)
-    wins      = [m for m in resolved if m["resolved_outcome"] == "win"]
-    losses    = [m for m in resolved if m["resolved_outcome"] == "loss"]
-
-    print(f"\n  Total resolved: {len(resolved)}")
-    print(f"  Wins:           {len(wins)} | Losses: {len(losses)}")
-    print(f"  Win rate:       {len(wins)/len(resolved):.0%}")
-    print(f"  Total PnL:      {'+'if total_pnl>=0 else ''}{total_pnl:.2f}")
-
-    print(f"\n  By city:")
-    for city in sorted(set(m["city"] for m in resolved)):
-        group = [m for m in resolved if m["city"] == city]
-        w     = len([m for m in group if m["resolved_outcome"] == "win"])
-        pnl   = sum(m["pnl"] for m in group)
-        name  = LOCATIONS[city]["name"]
-        print(f"    {name:<16} {w}/{len(group)} ({w/len(group):.0%})  PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
-
-    print(f"\n  Market details:")
-    for m in sorted(resolved, key=lambda x: x["date"]):
-        pos      = m.get("position", {})
-        unit_sym = "F" if m["unit"] == "F" else "C"
-        snaps    = m.get("forecast_snapshots", [])
-        first_fc = snaps[0]["best"] if snaps else None
-        last_fc  = snaps[-1]["best"] if snaps else None
-        label    = f"{pos.get('bucket_low')}-{pos.get('bucket_high')}{unit_sym}" if pos else "no position"
-        result   = m["resolved_outcome"].upper()
-        pnl_str  = f"{'+'if m['pnl']>=0 else ''}{m['pnl']:.2f}" if m["pnl"] is not None else "-"
-        fc_str   = f"forecast {first_fc}->{last_fc}{unit_sym}" if first_fc else "no forecast"
-        actual   = f"actual {m['actual_temp']}{unit_sym}" if m["actual_temp"] else ""
-        print(f"    {m['city_name']:<16} {m['date']} | {label:<14} | {fc_str} | {actual} | {result} {pnl_str}")
-
-    print(f"{'='*55}\n")
+    print_full_report(resolved=resolved, locations=LOCATIONS)
 
 # =============================================================================
 # MAIN LOOP

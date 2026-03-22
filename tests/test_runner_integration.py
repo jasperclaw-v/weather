@@ -19,8 +19,6 @@ def configure_temp_storage(monkeypatch, tmp_path: Path) -> None:
 
     monkeypatch.setattr(runtime, "DATA_DIR", data_dir)
     monkeypatch.setattr(runtime, "MARKETS_DIR", markets_dir)
-    monkeypatch.setattr(runtime, "CALIBRATION_FILE", calibration_file)
-    monkeypatch.setattr(runtime, "STATE_FILE", state_file)
 
 
 def test_scan_and_update_opens_position(monkeypatch, tmp_path):
