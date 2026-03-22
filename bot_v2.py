@@ -66,6 +66,7 @@ from weather.strategy.lifecycle import (
     refresh_signal_with_live_quotes,
 )
 from weather.strategy.scanner import build_outcomes, select_signal
+from weather.reporting import render_report_header, render_status
 
 # =============================================================================
 # CONFIG
@@ -329,12 +330,7 @@ def print_status():
     losses  = state["losses"]
     total   = wins + losses
 
-    print(f"\n{'='*55}")
-    print(f"  WEATHERBET — STATUS")
-    print(f"{'='*55}")
-    print(f"  Balance:     ${bal:,.2f}  (start ${start:,.2f}, {'+'if ret_pct>=0 else ''}{ret_pct:.1f}%)")
-    print(f"  Trades:      {total} | W: {wins} | L: {losses} | WR: {wins/total:.0%}" if total else "  No trades yet")
-    print(f"  Open:        {len(open_pos)}")
+    print(render_status(state, open_pos))
     print(f"  Resolved:    {len(resolved)}")
 
     if open_pos:
@@ -369,12 +365,9 @@ def print_report():
     markets  = load_all_markets()
     resolved = [m for m in markets if m["status"] == "resolved" and m.get("pnl") is not None]
 
-    print(f"\n{'='*55}")
-    print(f"  WEATHERBET — FULL REPORT")
-    print(f"{'='*55}")
+    print(render_report_header(resolved))
 
     if not resolved:
-        print("  No resolved markets yet.")
         return
 
     total_pnl = sum(m["pnl"] for m in resolved)
