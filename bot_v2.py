@@ -16,5 +16,10 @@ if __name__ == "__main__":
     elif cmd == "report":
         _cal = load_cal()
         print_report()
+    elif cmd == "backtest":
+        from weather.backtests.engine import replay_from_storage
+        import json
+
+        print(json.dumps(replay_from_storage(), indent=2))
     else:
-        print("Usage: python weatherbet.py [run|status|report]")
+        print("Usage: python weatherbet.py [run|status|report|backtest]")

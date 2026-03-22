@@ -18,3 +18,11 @@ def test_cli_report_command_runs():
         rc = main(["report"])
     assert rc == 0
     assert "FULL REPORT" in output.getvalue()
+
+
+def test_cli_backtest_command_runs():
+    output = io.StringIO()
+    with redirect_stdout(output):
+        rc = main(["backtest"])
+    assert rc == 0
+    assert '"n_trades"' in output.getvalue()
