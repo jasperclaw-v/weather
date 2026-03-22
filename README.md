@@ -2,6 +2,8 @@
 
 Automated weather market trading and research system for Polymarket. It starts from the original `weatherbot` prototype and is being refactored into a modular Python package with typed models, tests, and a clearer separation between forecasting, strategy, storage, and execution.
 
+Build and setup instructions live in [BUILD.md](/Users/jasperclaw/Desktop/weather_codex/BUILD.md).
+
 Current compatibility entrypoint:
 
 ```bash
