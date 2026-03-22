@@ -2,6 +2,8 @@
 
 from datetime import datetime, timezone, timedelta
 
+from weather.execution.service import maybe_execute_signal
+
 
 def scan_and_update(ctx):
     now = datetime.now(timezone.utc)
@@ -119,6 +121,9 @@ def scan_and_update(ctx):
 
                     if signal and signal["entry_price"] < ctx.MAX_PRICE:
                         balance -= signal["cost"]
+                        execution = maybe_execute_signal(signal, getattr(ctx, "execution_service", None))
+                        if execution is not None:
+                            signal["execution"] = execution
                         market["position"] = signal
                         state["total_trades"] += 1
                         new_pos += 1

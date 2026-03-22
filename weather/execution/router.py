@@ -32,6 +32,16 @@ class OrderIntent:
     order_type: str = "GTC"
 
 
+def order_intent_from_signal(signal: Dict[str, Any], side: str = "BUY", order_type: str = "GTC") -> OrderIntent:
+    return OrderIntent(
+        token_id=str(signal["market_id"]),
+        side=side,
+        price=float(signal["entry_price"]),
+        size=float(signal["shares"]),
+        order_type=order_type,
+    )
+
+
 class PolymarketOrderRouter:
     def __init__(self, auth: PolymarketAuthConfig):
         self.auth = auth

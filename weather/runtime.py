@@ -17,7 +17,7 @@ import time
 import requests
 from datetime import datetime
 
-from weather.app import build_runtime_context, load_runtime_config, runtime_locations
+from weather.app import build_execution_service, build_runtime_context, load_runtime_config, runtime_locations
 from weather.core.finance import calc_kelly as core_calc_kelly
 from weather.data.snapshots import take_forecast_snapshot
 from weather.data.storage import (
@@ -137,6 +137,7 @@ def runtime_context():
         run_calibration=run_calibration,
         set_calibration=_set_calibration,
         apply_monitor_exit=apply_monitor_exit,
+        execution_service=build_execution_service(),
     )
 
 

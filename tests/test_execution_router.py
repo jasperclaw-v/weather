@@ -2,7 +2,7 @@ import sys
 import types
 
 from weather.execution.auth import load_polymarket_auth_from_env
-from weather.execution.router import OrderIntent, PolymarketOrderRouter
+from weather.execution.router import OrderIntent, PolymarketOrderRouter, order_intent_from_signal
 
 
 class FakeCreds:
@@ -113,3 +113,10 @@ def test_router_estimate_fill(monkeypatch):
     estimate = router.estimate_fill("1", "BUY", 5)
     assert estimate["midpoint"] == 0.51
     assert estimate["spread"] == 0.02
+
+
+def test_order_intent_from_signal():
+    intent = order_intent_from_signal({"market_id": "1", "entry_price": 0.35, "shares": 22})
+    assert intent.token_id == "1"
+    assert intent.price == 0.35
+    assert intent.size == 22

@@ -14,6 +14,8 @@ from weather.core.constants import (
     DEFAULT_SIGMA_F,
 )
 from weather.data.mapping import LOCATIONS as LOCATION_MODELS, MONTHS
+from weather.execution.auth import load_polymarket_auth_from_env
+from weather.execution.service import ExecutionService
 from weather.strategy.risk import DEFAULT_TP_SCHEDULE
 
 
@@ -79,6 +81,7 @@ def build_runtime_context(
     run_calibration: Callable[[list], dict],
     set_calibration: Callable[[dict], None],
     apply_monitor_exit: Callable[..., tuple],
+    execution_service: Any = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         LOCATIONS=locations,
@@ -114,4 +117,9 @@ def build_runtime_context(
         run_calibration=run_calibration,
         set_calibration=set_calibration,
         apply_monitor_exit=apply_monitor_exit,
+        execution_service=execution_service,
     )
+
+
+def build_execution_service() -> ExecutionService:
+    return ExecutionService.from_auth_config(load_polymarket_auth_from_env())
