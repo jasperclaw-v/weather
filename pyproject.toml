@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "weather"
+version = "0.1.0"
+description = "Weather market research and trading system for Polymarket"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "requests>=2.31,<3",
+  "scipy>=1.11",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+ui = [
+  "streamlit>=1.30",
+  "plotly>=5.18",
+  "pandas>=2.1",
+]
+calibration = [
+  "numpy>=1.24",
+]
+
+[tool.setuptools.packages.find]
+include = ["weather*"]
+

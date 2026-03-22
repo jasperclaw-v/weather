@@ -1,8 +1,12 @@
-# 🌤 WeatherBet — Polymarket Weather Trading Bot
+# Weather
 
-Automated weather market trading bot for Polymarket. Finds mispriced temperature outcomes using real forecast data from multiple sources across 20 cities worldwide.
+Automated weather market trading and research system for Polymarket. It starts from the original `weatherbot` prototype and is being refactored into a modular Python package with typed models, tests, and a clearer separation between forecasting, strategy, storage, and execution.
 
-No SDK. No black box. Pure Python.
+Current compatibility entrypoint:
+
+```bash
+python weatherbet.py
+```
 
 ---
 
@@ -13,7 +17,7 @@ The foundation. Scans 6 US cities, fetches forecasts from NWS using airport stat
 
 No math, no complexity. Just the core logic — good for understanding how the system works.
 
-### `weatherbet.py` — Full Bot (current)
+### `weatherbet.py` — Compatibility Entrypoint
 Everything in v1, plus:
 - **20 cities** across 4 continents (US, Europe, Asia, South America, Oceania)
 - **3 forecast sources** — ECMWF (global), HRRR/GFS (US, hourly), METAR (real-time observations)
@@ -63,9 +67,9 @@ Every Polymarket weather market resolves on a specific airport station. NYC reso
 
 ## Installation
 ```bash
-git clone https://github.com/alteregoeth-ai/weatherbot
-cd weatherbot
-pip install requests
+git clone https://github.com/jasperclaw-v/weather
+cd weather
+python3 -m pip install -r requirements.txt
 ```
 
 Create `config.json` in the project folder:
@@ -86,15 +90,16 @@ Create `config.json` in the project folder:
 }
 ```
 
-Get a free Visual Crossing API key at visualcrossing.com — used to fetch actual temperatures after market resolution.
+Use a Visual Crossing API key only if you want historical actual-temperature lookup for resolved markets. Do not commit secrets in `config.json`.
 
 ---
 
 ## Usage
 ```bash
-python weatherbet.py           # start the bot — scans every hour
+python weatherbet.py           # start the bot
 python weatherbet.py status    # balance and open positions
-python weatherbet.py report    # full breakdown of all resolved markets
+python weatherbet.py report    # full breakdown of resolved markets
+python -m weather.cli.main     # equivalent package entrypoint
 ```
 
 ---
@@ -107,7 +112,7 @@ All data is saved to `data/markets/` — one JSON file per market. Each file con
 - Position details (entry, stop, PnL)
 - Final resolution outcome
 
-This data is used for self-calibration — the bot learns forecast accuracy per city over time and adjusts position sizing accordingly.
+This data is used for self-calibration. The refactor also adds package modules under `weather/` and tests under `tests/`.
 
 ---
 

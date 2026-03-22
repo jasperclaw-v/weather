@@ -1,0 +1,9 @@
+"""Shared constants for the weather trading system."""
+
+DEFAULT_SIGMA_F = 2.0
+DEFAULT_SIGMA_C = 1.2
+NEG_INF_BUCKET = -999.0
+POS_INF_BUCKET = 999.0
+DEFAULT_KELLY_FRACTION = 0.25
+DEFAULT_MAX_BET = 20.0
+
