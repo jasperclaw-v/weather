@@ -18,6 +18,7 @@ import time
 import requests
 from dataclasses import asdict
 from datetime import datetime, timezone, timedelta
+from types import SimpleNamespace
 
 from weather.config import load_config
 from weather.core.constants import (
@@ -67,6 +68,8 @@ from weather.strategy.lifecycle import (
 )
 from weather.strategy.scanner import build_outcomes, select_signal
 from weather.reporting import render_report_header, render_status
+from weather.engine import monitor_positions as engine_monitor_positions
+from weather.engine import scan_and_update as engine_scan_and_update
 
 # =============================================================================
 # CONFIG
@@ -129,189 +132,51 @@ def load_state():
 def save_state(state):
     storage_save_state(state)
 
-def scan_and_update():
-    """Main function of one cycle: updates forecasts, opens/closes positions."""
+def _set_calibration(value):
     global _cal
-    now      = datetime.now(timezone.utc)
-    state    = load_state()
-    balance  = state["balance"]
-    new_pos  = 0
-    closed   = 0
-    resolved = 0
+    _cal = value
 
-    for city_slug, loc in LOCATIONS.items():
-        unit = loc["unit"]
-        unit_sym = "F" if unit == "F" else "C"
-        print(f"  -> {loc['name']}...", end=" ", flush=True)
 
-        try:
-            dates = [(now + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(4)]
-            snapshots = take_forecast_snapshot(city_slug, dates)
-            time.sleep(0.3)
-        except Exception as e:
-            print(f"skipped ({e})")
-            continue
+def runtime_context():
+    return SimpleNamespace(
+        LOCATIONS=LOCATIONS,
+        MONTHS=MONTHS,
+        MIN_HOURS=MIN_HOURS,
+        MAX_HOURS=MAX_HOURS,
+        MIN_VOLUME=MIN_VOLUME,
+        MIN_EV=MIN_EV,
+        KELLY_FRACTION=KELLY_FRACTION,
+        MAX_BET=MAX_BET,
+        MAX_SLIPPAGE=MAX_SLIPPAGE,
+        MAX_PRICE=MAX_PRICE,
+        CALIBRATION_MIN=CALIBRATION_MIN,
+        DEFAULT_TP_SCHEDULE=DEFAULT_TP_SCHEDULE,
+        requests=requests,
+        sleep=time.sleep,
+        load_state=load_state,
+        save_state=save_state,
+        load_market=load_market,
+        save_market=save_market,
+        load_all_markets=load_all_markets,
+        new_market=new_market,
+        take_forecast_snapshot=take_forecast_snapshot,
+        get_polymarket_event=get_polymarket_event,
+        hours_to_resolution=hours_to_resolution,
+        build_outcomes=build_outcomes,
+        apply_stop_and_forecast_exits=apply_stop_and_forecast_exits,
+        get_sigma=get_sigma,
+        select_signal=select_signal,
+        refresh_signal_with_live_quotes=refresh_signal_with_live_quotes,
+        check_market_resolved=check_market_resolved,
+        apply_resolution=apply_resolution,
+        run_calibration=run_calibration,
+        set_calibration=_set_calibration,
+        apply_monitor_exit=apply_monitor_exit,
+    )
 
-        for i, date in enumerate(dates):
-            dt    = datetime.strptime(date, "%Y-%m-%d")
-            event = get_polymarket_event(city_slug, MONTHS[dt.month - 1], dt.day, dt.year)
-            if not event:
-                continue
 
-            end_date = event.get("endDate", "")
-            hours    = hours_to_resolution(end_date) if end_date else 0
-            horizon  = f"D+{i}"
-
-            # Load or create market record
-            mkt = load_market(city_slug, date)
-            if mkt is None:
-                if hours < MIN_HOURS or hours > MAX_HOURS:
-                    continue
-                mkt = new_market(city_slug, date, event, hours)
-
-            # Skip if market already resolved
-            if mkt["status"] == "resolved":
-                continue
-
-            # Update outcomes list — prices taken directly from event
-            outcomes = build_outcomes(event)
-            mkt["all_outcomes"] = outcomes
-
-            # Forecast snapshot
-            snap = snapshots.get(date, {})
-            forecast_snap = {
-                "ts":          snap.get("ts"),
-                "horizon":     horizon,
-                "hours_left":  round(hours, 1),
-                "ecmwf":       snap.get("ecmwf"),
-                "hrrr":        snap.get("hrrr"),
-                "metar":       snap.get("metar"),
-                "best":        snap.get("best"),
-                "best_source": snap.get("best_source"),
-            }
-            mkt["forecast_snapshots"].append(forecast_snap)
-
-            # Market price snapshot
-            top = max(outcomes, key=lambda x: x["price"]) if outcomes else None
-            market_snap = {
-                "ts":       snap.get("ts"),
-                "top_bucket": f"{top['range'][0]}-{top['range'][1]}{unit_sym}" if top else None,
-                "top_price":  top["price"] if top else None,
-            }
-            mkt["market_snapshots"].append(market_snap)
-
-            forecast_temp = snap.get("best")
-            best_source   = snap.get("best_source")
-
-            mkt, balance, closed_now, exit_reason = apply_stop_and_forecast_exits(
-                market=mkt,
-                outcomes=outcomes,
-                forecast_temp=forecast_temp,
-                balance=balance,
-                ts=snap.get("ts"),
-            )
-            if closed_now:
-                closed += closed_now
-                current_price = mkt["position"]["exit_price"]
-                pnl = mkt["position"]["pnl"]
-                if exit_reason == "CLOSE":
-                    print(f"  [CLOSE] {loc['name']} {date} — forecast changed | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
-                else:
-                    print(f"  [{exit_reason}] {loc['name']} {date} | entry ${mkt['position']['entry_price']:.3f} exit ${current_price:.3f} | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
-
-            # --- OPEN POSITION ---
-            if (not mkt.get("position") or mkt["position"].get("status") != "open") and forecast_temp is not None and hours >= MIN_HOURS:
-                sigma = get_sigma(city_slug, best_source or "ecmwf")
-                best_signal = select_signal(
-                    outcomes=outcomes,
-                    forecast_temp=forecast_temp,
-                    sigma=sigma,
-                    best_source=best_source,
-                    opened_at=snap.get("ts"),
-                    balance=balance,
-                    min_volume=MIN_VOLUME,
-                    min_ev=MIN_EV,
-                    kelly_fraction=KELLY_FRACTION,
-                    max_bet=MAX_BET,
-                )
-
-                if best_signal:
-                    best_signal, note = refresh_signal_with_live_quotes(
-                        best_signal,
-                        max_slippage=MAX_SLIPPAGE,
-                        max_price=MAX_PRICE,
-                    )
-                    if note and note.startswith("skip:"):
-                        _, ask, spread = note.split(":")
-                        print(f"  [SKIP] {loc['name']} {date} — real ask ${ask} spread ${spread}")
-                    elif note and note.startswith("warn:") and best_signal:
-                        print(f"  [WARN] Could not fetch real ask for {best_signal['market_id']}: {note[5:]}")
-
-                    if best_signal and best_signal["entry_price"] < MAX_PRICE:
-                        balance -= best_signal["cost"]
-                        mkt["position"] = best_signal
-                        state["total_trades"] += 1
-                        new_pos += 1
-                        bucket_label = f"{best_signal['bucket_low']}-{best_signal['bucket_high']}{unit_sym}"
-                        print(f"  [BUY]  {loc['name']} {horizon} {date} | {bucket_label} | "
-                              f"${best_signal['entry_price']:.3f} | EV {best_signal['ev']:+.2f} | "
-                              f"${best_signal['cost']:.2f} ({best_signal['forecast_src'].upper()})")
-
-            # Market closed by time
-            if hours < 0.5 and mkt["status"] == "open":
-                mkt["status"] = "closed"
-
-            save_market(mkt)
-            time.sleep(0.1)
-
-        print("ok")
-
-    # --- AUTO-RESOLUTION ---
-    for mkt in load_all_markets():
-        if mkt["status"] == "resolved":
-            continue
-
-        pos = mkt.get("position")
-        if not pos or pos.get("status") != "open":
-            continue
-
-        market_id = pos.get("market_id")
-        if not market_id:
-            continue
-
-        # Check if market closed on Polymarket
-        won = check_market_resolved(market_id)
-        if won is None:
-            continue  # market still open
-
-        mkt, credit, outcome = apply_resolution(mkt, won, ts=now.isoformat())
-        balance += credit
-
-        if won:
-            state["wins"] += 1
-        else:
-            state["losses"] += 1
-
-        result = "WIN" if won else "LOSS"
-        pnl = mkt["pnl"]
-        print(f"  [{result}] {mkt['city_name']} {mkt['date']} | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
-        resolved += 1
-
-        save_market(mkt)
-        time.sleep(0.3)
-
-    state["balance"]      = round(balance, 2)
-    state["peak_balance"] = max(state.get("peak_balance", balance), balance)
-    save_state(state)
-
-    # Run calibration if enough data collected
-    all_mkts = load_all_markets()
-    resolved_count = len([m for m in all_mkts if m["status"] == "resolved"])
-    if resolved_count >= CALIBRATION_MIN:
-        global _cal
-        _cal = run_calibration(all_mkts)
-
-    return new_pos, closed, resolved
+def scan_and_update():
+    return engine_scan_and_update(runtime_context())
 
 # =============================================================================
 # REPORT
@@ -410,69 +275,7 @@ def print_report():
 MONITOR_INTERVAL = 600  # monitor positions every 10 minutes
 
 def monitor_positions():
-    """Quick stop check on open positions without full scan."""
-    markets  = load_all_markets()
-    open_pos = [m for m in markets if m.get("position") and m["position"].get("status") == "open"]
-    if not open_pos:
-        return 0
-
-    state   = load_state()
-    balance = state["balance"]
-    closed  = 0
-
-    for mkt in open_pos:
-        pos = mkt["position"]
-        mid = pos["market_id"]
-
-        # Fetch real bestBid from Polymarket API — actual sell price
-        current_price = None
-        try:
-            r = requests.get(f"https://gamma-api.polymarket.com/markets/{mid}", timeout=(3, 5))
-            mdata = r.json()
-            best_bid = mdata.get("bestBid")
-            if best_bid is not None:
-                current_price = float(best_bid)
-        except Exception:
-            pass
-
-        # Fallback to cached price if API failed
-        if current_price is None:
-            for o in mkt.get("all_outcomes", []):
-                if o["market_id"] == mid:
-                    current_price = o.get("bid", o["price"])
-                    break
-
-        if current_price is None:
-            continue
-
-        city_name = LOCATIONS.get(mkt["city"], {}).get("name", mkt["city"])
-
-        # Hours left to resolution
-        end_date = mkt.get("event_end_date", "")
-        hours_left = hours_to_resolution(end_date) if end_date else 999.0
-
-        pre_stop = pos.get("stop_price", pos["entry_price"] * 0.80)
-        mkt, did_close, reason = apply_monitor_exit(
-            market=mkt,
-            current_price=current_price,
-            hours_left=hours_left,
-            schedule=DEFAULT_TP_SCHEDULE,
-        )
-        post_stop = pos.get("stop_price", pre_stop)
-        if post_stop != pre_stop and post_stop == pos["entry_price"]:
-            print(f"  [TRAILING] {city_name} {mkt['date']} — stop moved to breakeven ${pos['entry_price']:.3f}")
-        if did_close:
-            pnl = pos["pnl"]
-            balance += pos["cost"] + pnl
-            closed += 1
-            print(f"  [{reason}] {city_name} {mkt['date']} | entry ${pos['entry_price']:.3f} exit ${current_price:.3f} | {hours_left:.0f}h left | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
-            save_market(mkt)
-
-    if closed:
-        state["balance"] = round(balance, 2)
-        save_state(state)
-
-    return closed
+    return engine_monitor_positions(runtime_context())
 
 
 def run_loop():
