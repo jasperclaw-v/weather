@@ -21,5 +21,11 @@ if __name__ == "__main__":
         import json
 
         print(json.dumps(replay_from_storage(), indent=2))
+    elif cmd == "scan":
+        from weather.scan import format_paper_scan_report, run_paper_scan
+
+        max_price = float(sys.argv[2]) if len(sys.argv) > 2 else None
+        max_slippage = float(sys.argv[3]) if len(sys.argv) > 3 else None
+        print(format_paper_scan_report(run_paper_scan(max_price=max_price, max_slippage=max_slippage)))
     else:
-        print("Usage: python weatherbet.py [run|status|report|backtest]")
+        print("Usage: python weatherbet.py [run|status|report|backtest|scan [max_price] [max_slippage]]")
