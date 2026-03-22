@@ -58,6 +58,13 @@ from weather.strategy.calibration import (
     run_sigma_calibration,
 )
 from weather.strategy.risk import DEFAULT_TP_SCHEDULE, get_tp_threshold
+from weather.strategy.lifecycle import (
+    apply_monitor_exit,
+    apply_resolution,
+    apply_stop_and_forecast_exits,
+    find_outcome_price,
+    refresh_signal_with_live_quotes,
+)
 from weather.strategy.scanner import build_outcomes, select_signal
 
 # =============================================================================
@@ -195,67 +202,24 @@ def scan_and_update():
             forecast_temp = snap.get("best")
             best_source   = snap.get("best_source")
 
-            # --- STOP-LOSS AND TRAILING STOP ---
-            if mkt.get("position") and mkt["position"].get("status") == "open":
-                pos = mkt["position"]
-                current_price = None
-                for o in outcomes:
-                    if o["market_id"] == pos["market_id"]:
-                        current_price = o["price"]
-                        break
-
-                if current_price is not None:
-                    current_price = o.get("bid", current_price)  # sell at bid
-                    entry = pos["entry_price"]
-                    stop  = pos.get("stop_price", entry * 0.80)  # 20% stop by default
-
-                    # Trailing: if up 20%+ — move stop to breakeven
-                    if current_price >= entry * 1.20 and stop < entry:
-                        pos["stop_price"] = entry
-                        pos["trailing_activated"] = True
-
-                    # Check stop
-                    if current_price <= stop:
-                        pnl = round((current_price - entry) * pos["shares"], 2)
-                        balance += pos["cost"] + pnl
-                        pos["closed_at"]    = snap.get("ts")
-                        pos["close_reason"] = "stop_loss" if current_price < entry else "trailing_stop"
-                        pos["exit_price"]   = current_price
-                        pos["pnl"]          = pnl
-                        pos["status"]       = "closed"
-                        closed += 1
-                        reason = "STOP" if current_price < entry else "TRAILING BE"
-                        print(f"  [{reason}] {loc['name']} {date} | entry ${entry:.3f} exit ${current_price:.3f} | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
-
-            # --- CLOSE POSITION if forecast shifted 2+ degrees ---
-            if mkt.get("position") and forecast_temp is not None:
-                pos = mkt["position"]
-                old_bucket_low  = pos["bucket_low"]
-                old_bucket_high = pos["bucket_high"]
-                # 2-degree buffer — avoid closing on small forecast fluctuations
-                unit = loc["unit"]
-                buffer = 2.0 if unit == "F" else 1.0
-                mid_bucket = (old_bucket_low + old_bucket_high) / 2 if old_bucket_low != -999 and old_bucket_high != 999 else forecast_temp
-                forecast_far = abs(forecast_temp - mid_bucket) > (abs(mid_bucket - old_bucket_low) + buffer)
-                if not in_bucket(forecast_temp, old_bucket_low, old_bucket_high) and forecast_far:
-                    current_price = None
-                    for o in outcomes:
-                        if o["market_id"] == pos["market_id"]:
-                            current_price = o["price"]
-                            break
-                    if current_price is not None:
-                        pnl = round((current_price - pos["entry_price"]) * pos["shares"], 2)
-                        balance += pos["cost"] + pnl
-                        mkt["position"]["closed_at"]    = snap.get("ts")
-                        mkt["position"]["close_reason"] = "forecast_changed"
-                        mkt["position"]["exit_price"]   = current_price
-                        mkt["position"]["pnl"]          = pnl
-                        mkt["position"]["status"]       = "closed"
-                        closed += 1
-                        print(f"  [CLOSE] {loc['name']} {date} — forecast changed | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
+            mkt, balance, closed_now, exit_reason = apply_stop_and_forecast_exits(
+                market=mkt,
+                outcomes=outcomes,
+                forecast_temp=forecast_temp,
+                balance=balance,
+                ts=snap.get("ts"),
+            )
+            if closed_now:
+                closed += closed_now
+                current_price = mkt["position"]["exit_price"]
+                pnl = mkt["position"]["pnl"]
+                if exit_reason == "CLOSE":
+                    print(f"  [CLOSE] {loc['name']} {date} — forecast changed | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
+                else:
+                    print(f"  [{exit_reason}] {loc['name']} {date} | entry ${mkt['position']['entry_price']:.3f} exit ${current_price:.3f} | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
 
             # --- OPEN POSITION ---
-            if not mkt.get("position") and forecast_temp is not None and hours >= MIN_HOURS:
+            if (not mkt.get("position") or mkt["position"].get("status") != "open") and forecast_temp is not None and hours >= MIN_HOURS:
                 sigma = get_sigma(city_slug, best_source or "ecmwf")
                 best_signal = select_signal(
                     outcomes=outcomes,
@@ -271,28 +235,18 @@ def scan_and_update():
                 )
 
                 if best_signal:
-                    # Fetch real bestAsk from Polymarket API for accurate entry price
-                    skip_position = False
-                    try:
-                        r = requests.get(f"https://gamma-api.polymarket.com/markets/{best_signal['market_id']}", timeout=(3, 5))
-                        mdata = r.json()
-                        real_ask = float(mdata.get("bestAsk", best_signal["entry_price"]))
-                        real_bid = float(mdata.get("bestBid", best_signal["bid_at_entry"]))
-                        real_spread = round(real_ask - real_bid, 4)
-                        # Re-check slippage and price with real values
-                        if real_spread > MAX_SLIPPAGE or real_ask >= MAX_PRICE:
-                            print(f"  [SKIP] {loc['name']} {date} — real ask ${real_ask:.3f} spread ${real_spread:.3f}")
-                            skip_position = True
-                        else:
-                            best_signal["entry_price"]  = real_ask
-                            best_signal["bid_at_entry"] = real_bid
-                            best_signal["spread"]       = real_spread
-                            best_signal["shares"]       = round(best_signal["cost"] / real_ask, 2)
-                            best_signal["ev"]           = round(calc_ev(best_signal["p"], real_ask), 4)
-                    except Exception as e:
-                        print(f"  [WARN] Could not fetch real ask for {best_signal['market_id']}: {e}")
+                    best_signal, note = refresh_signal_with_live_quotes(
+                        best_signal,
+                        max_slippage=MAX_SLIPPAGE,
+                        max_price=MAX_PRICE,
+                    )
+                    if note and note.startswith("skip:"):
+                        _, ask, spread = note.split(":")
+                        print(f"  [SKIP] {loc['name']} {date} — real ask ${ask} spread ${spread}")
+                    elif note and note.startswith("warn:") and best_signal:
+                        print(f"  [WARN] Could not fetch real ask for {best_signal['market_id']}: {note[5:]}")
 
-                    if not skip_position and best_signal["entry_price"] < MAX_PRICE:
+                    if best_signal and best_signal["entry_price"] < MAX_PRICE:
                         balance -= best_signal["cost"]
                         mkt["position"] = best_signal
                         state["total_trades"] += 1
@@ -329,21 +283,8 @@ def scan_and_update():
         if won is None:
             continue  # market still open
 
-        # Market closed — record result
-        price  = pos["entry_price"]
-        size   = pos["cost"]
-        shares = pos["shares"]
-        pnl    = round(shares * (1 - price), 2) if won else round(-size, 2)
-
-        balance += size + pnl
-        pos["exit_price"]   = 1.0 if won else 0.0
-        pos["pnl"]          = pnl
-        pos["close_reason"] = "resolved"
-        pos["closed_at"]    = now.isoformat()
-        pos["status"]       = "closed"
-        mkt["pnl"]          = pnl
-        mkt["status"]       = "resolved"
-        mkt["resolved_outcome"] = "win" if won else "loss"
+        mkt, credit, outcome = apply_resolution(mkt, won, ts=now.isoformat())
+        balance += credit
 
         if won:
             state["wins"] += 1
@@ -351,6 +292,7 @@ def scan_and_update():
             state["losses"] += 1
 
         result = "WIN" if won else "LOSS"
+        pnl = mkt["pnl"]
         print(f"  [{result}] {mkt['city_name']} {mkt['date']} | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
         resolved += 1
 
@@ -408,10 +350,7 @@ def print_status():
             snaps = m.get("market_snapshots", [])
             if snaps:
                 # Find our bucket price in all_outcomes
-                for o in m.get("all_outcomes", []):
-                    if o["market_id"] == pos["market_id"]:
-                        current_price = o["price"]
-                        break
+                current_price = find_outcome_price(m.get("all_outcomes", []), pos["market_id"], side="price") or current_price
 
             unrealized = round((current_price - pos["entry_price"]) * pos["shares"], 2)
             total_unrealized += unrealized
@@ -513,45 +452,27 @@ def monitor_positions():
         if current_price is None:
             continue
 
-        entry = pos["entry_price"]
-        stop  = pos.get("stop_price", entry * 0.80)
         city_name = LOCATIONS.get(mkt["city"], {}).get("name", mkt["city"])
 
         # Hours left to resolution
         end_date = mkt.get("event_end_date", "")
         hours_left = hours_to_resolution(end_date) if end_date else 999.0
 
-        take_profit = get_tp_threshold(hours_left, DEFAULT_TP_SCHEDULE)
-
-        # Trailing: if up 20%+ — move stop to breakeven
-        if current_price >= entry * 1.20 and stop < entry:
-            pos["stop_price"] = entry
-            pos["trailing_activated"] = True
-            print(f"  [TRAILING] {city_name} {mkt['date']} — stop moved to breakeven ${entry:.3f}")
-
-        # Check take-profit
-        take_triggered = take_profit is not None and current_price >= take_profit
-        # Check stop
-        stop_triggered = current_price <= stop
-
-        if take_triggered or stop_triggered:
-            pnl = round((current_price - entry) * pos["shares"], 2)
+        pre_stop = pos.get("stop_price", pos["entry_price"] * 0.80)
+        mkt, did_close, reason = apply_monitor_exit(
+            market=mkt,
+            current_price=current_price,
+            hours_left=hours_left,
+            schedule=DEFAULT_TP_SCHEDULE,
+        )
+        post_stop = pos.get("stop_price", pre_stop)
+        if post_stop != pre_stop and post_stop == pos["entry_price"]:
+            print(f"  [TRAILING] {city_name} {mkt['date']} — stop moved to breakeven ${pos['entry_price']:.3f}")
+        if did_close:
+            pnl = pos["pnl"]
             balance += pos["cost"] + pnl
-            pos["closed_at"]    = datetime.now(timezone.utc).isoformat()
-            if take_triggered:
-                pos["close_reason"] = "take_profit"
-                reason = "TAKE"
-            elif current_price < entry:
-                pos["close_reason"] = "stop_loss"
-                reason = "STOP"
-            else:
-                pos["close_reason"] = "trailing_stop"
-                reason = "TRAILING BE"
-            pos["exit_price"]   = current_price
-            pos["pnl"]          = pnl
-            pos["status"]       = "closed"
             closed += 1
-            print(f"  [{reason}] {city_name} {mkt['date']} | entry ${entry:.3f} exit ${current_price:.3f} | {hours_left:.0f}h left | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
+            print(f"  [{reason}] {city_name} {mkt['date']} | entry ${pos['entry_price']:.3f} exit ${current_price:.3f} | {hours_left:.0f}h left | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
             save_market(mkt)
 
     if closed:
